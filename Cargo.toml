@@ -1,0 +1,8 @@
+[package]
+name = "ds_leader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+log = "0.4.29"
+simplelog = "0.12.2"
