@@ -1,7 +1,5 @@
 use std::{
-    io::{self, Read},
-    net::{Ipv4Addr, SocketAddrV4, TcpListener, UdpSocket},
-    time::Duration,
+    io::{self, Read}, net::{Ipv4Addr, SocketAddrV4, TcpListener, UdpSocket}, thread::sleep, time::Duration,
 };
 
 use log::{debug, info, warn};
@@ -11,7 +9,7 @@ use crate::{
         LOCALHOST, MAX_CLUSTER_SIZE, MAX_MESSAGES, MAX_MESSAGES_PER_TICK, MAX_MISSED_HEARTBEATS,
         PORT_START, READ_TIMEOUT,
     },
-    message::{Message, MessageHeader, MessageType},
+    message::{Message, MessageType},
     snowflake::generate_snowflake_id,
     view::{
         View,
@@ -160,8 +158,21 @@ impl Replica {
         udp_socket.send_to(&msg.to_bytes(), primary_addr).unwrap();
         let mut msg_bytes = [0_u8; Message::BYTE_LENGTH];
         std::thread::sleep(Duration::from_millis(30));
-        udp_socket.set_nonblocking(false).unwrap(); // enable blocking
-        udp_socket.recv(&mut msg_bytes).unwrap();
+        loop {
+            match udp_socket.recv(&mut msg_bytes) {
+                Ok(_) => break,
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::TimedOut
+                        || err.kind() == io::ErrorKind::WouldBlock
+                    {
+                        println!("Err: {:?}", err);
+                        // panic!("Connection timed out");
+                    } else {
+                        panic!("IO Error");
+                    }
+                }
+            }
+        }
         let msg = Message::from_bytes(msg_bytes).unwrap();
         assert!(msg.checksum_matches(), "Checksum missmatch");
         info!("Received this answer to view change request: {:?}", msg);
@@ -185,29 +196,29 @@ impl Replica {
     pub fn run_for_ms(&mut self, _millis: usize) -> Result<(), std::io::Error> {
         if self.buffer.msg_count_since_last_tick > 0 {
             info!("We have a new message");
-            let last_msg = self.buffer.retrieve_message();
-            match last_msg.msg_type {
-                MessageType::ViewInfoRequest => {
-                    // response to sender
-                    let sender = last_msg.header.sender_id;
-                    let msg_id = generate_snowflake_id(self.id);
-                    let msg = Message::new(
-                        self.id,
-                        MessageType::ViewInfoResponse(self.view.to_view_info()),
-                        msg_id,
-                    );
-                    self.udp_socket
-                        .send_to(
-                            &msg.to_bytes(),
-                            SocketAddrV4::new(LOCALHOST, PORT_START + sender as u16),
-                        )
-                        .unwrap();
-                    debug!("view: {:?}", self.view);
-
-                    self.try_add_new_replica(sender).unwrap();
-                }
-                _ => info!("Some other message"),
-            }
+        //     let last_msg = self.buffer.retrieve_message();
+        //     match last_msg.msg_type {
+        //         MessageType::ViewInfoRequest => {
+        //             // response to sender
+        //             let sender = last_msg.header.sender_id;
+        //             let msg_id = generate_snowflake_id(self.id);
+        //             let msg = Message::new(
+        //                 self.id,
+        //                 MessageType::ViewInfoResponse(self.view.to_view_info()),
+        //                 msg_id,
+        //             );
+        //             self.udp_socket
+        //                 .send_to(
+        //                     &msg.to_bytes(),
+        //                     SocketAddrV4::new(LOCALHOST, PORT_START + sender as u16),
+        //                 )
+        //                 .unwrap();
+        //             debug!("view: {:?}", self.view);
+        //
+        //             self.try_add_new_replica(sender).unwrap();
+        //         }
+        //         _ => info!("Some other message"),
+        //     }
         }
         // info!("Running for {_millis} milliseconds.");
         // info!("I am this replica: {:?}", self);
@@ -219,14 +230,18 @@ impl Replica {
     /// Send heartbeat to other replicas in cluster.
     /// Receive heartbeats from other replicas.
     pub fn tick(&mut self) -> Result<(), std::io::Error> {
+        std::thread::sleep(Duration::from_secs(2));
+        println!("/n/n/n");
         debug!("Ticking...");
         debug!("View: {:?}", self.view);
         self.collect_messages();
         self.heartbeats = [false; MAX_CLUSTER_SIZE];
         let mut responses = vec![];
+        let mut add_new_replica: Option<ReplicaId> = None;
 
-        let msgs = self.buffer.retrieve_messages_since_last_tick();
-        debug!("Got {} messages.", msgs.len());
+        let (msgs, msg_count) = self.buffer.retrieve_messages_since_last_tick();
+        debug!("Got {} messages.", msg_count);
+        let msgs = msgs.iter().filter(|m| m.is_some()).collect::<Vec<_>>().clone();
         let (mut idx_other_msgs, mut other_msgs) = (0, [None; MAX_MESSAGES_PER_TICK]); // index in msgs
         for msg in msgs {
             if msg.is_none() {
@@ -248,7 +263,7 @@ impl Replica {
                             MessageType::ViewInfoResponse(self.view.to_view_info()),
                             generate_snowflake_id(self.id),
                         );
-                        self.view.add_replica(msg.header.sender_id);
+                        add_new_replica = Some(msg.header.sender_id);
                         responses.push((response, SocketAddrV4::new(LOCALHOST, port)));
                     }
                     MessageType::RequestViewChange(view_info) => {
@@ -269,6 +284,11 @@ impl Replica {
                 other_msgs[idx_other_msgs] = Some(msg);
                 idx_other_msgs += 1;
             }
+        }
+
+        if let Some(new_id) = add_new_replica {
+            debug!("Adding {new_id}");
+            self.try_add_new_replica(new_id).unwrap();
         }
 
         for response in responses {
@@ -312,6 +332,7 @@ impl Replica {
             );
             let num_messages = num_bytes / Message::BYTE_LENGTH;
             info!("Replica received [{num_messages}] new messages");
+            self.buffer.msg_count_since_last_tick = num_messages as u16;
             info!(
                 "Msg count since last tick: {}",
                 self.buffer.msg_count_since_last_tick
@@ -382,7 +403,6 @@ impl Replica {
                 "rc_hbs: {:?} - {:?}",
                 received_hbs, self.view.occupied_ports
             );
-            debug!("Handling missing heartbeat.");
             for id in self.view.occupied_ports.iter().filter_map(|p| {
                 if *p > PORT_START as u32 && *p != self.port as u32 {
                     Some((p - PORT_START as u32) as usize)
@@ -392,11 +412,12 @@ impl Replica {
             }) {
                 if !self.heartbeats[id] {
                     info!("Missing heartbeat from replica {id}. Incrementing TSLHB for it.");
+                    debug!("tslhb: {:?}", self.ticks_since_last_heartbeat);
+                    debug!("hbs: {:?}", self.heartbeats);
                     self.ticks_since_last_heartbeat[id] += 1;
                     if self.ticks_since_last_heartbeat[id] > MAX_MISSED_HEARTBEATS {
-                        debug!("tslhb: {:?}", self.ticks_since_last_heartbeat);
-                        debug!("hbs: {:?}", self.heartbeats);
                         debug!("ports: {:?}", self.view.occupied_ports);
+                        // self.remove_replica();
                         todo!("Remove replica");
                     }
                 } else {
@@ -407,7 +428,7 @@ impl Replica {
         }
 
         if received_hbs > 0 {
-            println!("Got heartbeats!!!")
+            println!("Got heartbeats: {:?}", self.heartbeats);
         }
     }
 
@@ -522,23 +543,23 @@ impl MessageBuffer {
         self.msg_count_since_last_tick -= 1;
         self.idx_last_message += 1;
         self.idx_last_message %= MAX_MESSAGES;
-        debug!("Retrieving message from {idx}");
+        debug!("Retrieving message (fn) from {idx}");
         &self.buffer[idx]
     }
 
-    /// Returns all messages since last tick
+    /// Returns all messages since last tick, and the count of the messages since the last tick
     /// Messages start @0
     pub fn retrieve_messages_since_last_tick(
         &mut self,
-    ) -> [Option<&Message>; MAX_MESSAGES_PER_TICK] {
+    ) -> ([Option<&Message>; MAX_MESSAGES_PER_TICK], usize) {
         debug!("Retrieving messages since last tick");
         let mut msgs: [Option<&Message>; MAX_MESSAGES_PER_TICK] = [None; MAX_MESSAGES_PER_TICK];
         let mut idx_msgs = 0;
         if self.msg_count_since_last_tick == 0 {
-            // debug!("No message since last tick");
-            return msgs;
+            debug!("No messages since last tick");
+            return (msgs, 0);
         }
-        loop {
+        for _ in 0..self.msg_count_since_last_tick {
             let idx = self.idx_last_message;
             self.msg_count_since_last_tick -= 1;
             self.idx_last_message += 1;
@@ -546,11 +567,8 @@ impl MessageBuffer {
             debug!("Retrieving message from {idx}");
             msgs[idx_msgs] = Some(&self.buffer[idx]);
             idx_msgs += 1;
-            if self.msg_count_since_last_tick == 0 {
-                break;
-            }
         }
-        msgs
+        (msgs, self.msg_count_since_last_tick as usize)
     }
 }
 
