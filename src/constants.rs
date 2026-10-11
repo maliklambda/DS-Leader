@@ -25,3 +25,6 @@ pub const READ_TIMEOUT: Duration = Duration::from_millis(10);
 /// Maximum required votes for a quroum.
 /// A quroum cannot require more votes than this.
 pub const MAX_REQUIRED_VOTES: usize = MAX_CLUSTER_SIZE / 2;
+
+/// The number of missed heartbeats after which a replica is removed from the cluster.
+pub const MAX_MISSED_HEARTBEATS: usize = 100;

@@ -13,7 +13,7 @@ pub struct View {
     pub leader: ReplicaId,
 
     /// All known replicas in the cluster.
-    pub replicas: [ReplicaId; MAX_CLUSTER_SIZE],
+    // pub replicas: [ReplicaId; MAX_CLUSTER_SIZE],
 
     /// Keep track of all opened ports in the cluster.
     /// Index is the same as in replicas
@@ -32,7 +32,7 @@ impl View {
 
     /// Add a new replica to the view.
     pub fn add_replica(&mut self, replica_id: ReplicaId) {
-        self.replicas[replica_id as usize] = replica_id;
+        // self.replicas[replica_id as usize] = replica_id+1;
         self.occupied_ports[replica_id as usize] = replica_id + PORT_START as u32;
     }
 }
@@ -40,17 +40,9 @@ impl View {
 impl From<ViewInfo> for View {
     fn from(value: ViewInfo) -> Self {
         debug!("active ports: {:?}", value.active_ports);
-        let replicas: [ReplicaId; MAX_CLUSTER_SIZE] = value.active_ports.map(|port| {
-            if port < PORT_START as u32 {
-                port
-            } else {
-                port - PORT_START as u32
-            }
-        });
         View {
             leader: value.leader_id,
             occupied_ports: value.active_ports,
-            replicas,
         }
     }
 }

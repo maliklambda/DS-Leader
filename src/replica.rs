@@ -4,13 +4,14 @@ use std::{
     time::Duration,
 };
 
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::{
     constants::{
-        LOCALHOST, MAX_CLUSTER_SIZE, MAX_MESSAGES, MAX_MESSAGES_PER_TICK, PORT_START, READ_TIMEOUT,
+        LOCALHOST, MAX_CLUSTER_SIZE, MAX_MESSAGES, MAX_MESSAGES_PER_TICK, MAX_MISSED_HEARTBEATS,
+        PORT_START, READ_TIMEOUT,
     },
-    message::{Message, MessageType},
+    message::{Message, MessageHeader, MessageType},
     snowflake::generate_snowflake_id,
     view::{
         View,
@@ -33,6 +34,10 @@ pub struct Replica {
 
     /// Buffer for heartbeats sent by other replicas.
     pub heartbeats: [bool; MAX_CLUSTER_SIZE],
+
+    /// Record the number of ticks since the last received heartbeat.
+    /// Closely related to heartbeats.
+    pub ticks_since_last_heartbeat: [usize; MAX_CLUSTER_SIZE],
 
     /// host ip - for testing it's always localhost
     ip: Ipv4Addr,
@@ -63,15 +68,13 @@ impl Replica {
         if count == 0 {
             info!("Found empty cluster. I am becoming the primary!");
             let id: ReplicaId = count;
-            let mut replicas = [0u32; MAX_CLUSTER_SIZE];
             let port = PORT_START as u32;
             active_ports[0] = port;
-            replicas[0] = id;
-            let view = View {
+            let mut view = View {
                 leader: id,
-                replicas,
                 occupied_ports: active_ports,
             };
+            view.add_replica(id);
             info!("Got this view: {:?}", view);
             let udp_socket = UdpSocket::bind(SocketAddrV4::new(LOCALHOST, port as u16)).unwrap();
             udp_socket.set_nonblocking(true).unwrap();
@@ -83,6 +86,7 @@ impl Replica {
                 buffer: MessageBuffer::zero_buffer(),
                 ip,
                 heartbeats: [false; MAX_CLUSTER_SIZE],
+                ticks_since_last_heartbeat: [0; MAX_CLUSTER_SIZE],
                 port: PORT_START,
                 udp_socket,
                 voting_status: VotingStatus::Idle,
@@ -120,14 +124,18 @@ impl Replica {
 
         // Receive XIsPrimary Message
         let mut buf = [0_u8; Message::BYTE_LENGTH];
-        match udp_socket.recv(&mut buf) {
-            Ok(_) => (),
-            Err(err) => {
-                if err.kind() == io::ErrorKind::TimedOut || err.kind() == io::ErrorKind::WouldBlock
-                {
-                    panic!("Connection timed out");
-                } else {
-                    panic!("IO Error");
+        loop {
+            match udp_socket.recv(&mut buf) {
+                Ok(_) => break,
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::TimedOut
+                        || err.kind() == io::ErrorKind::WouldBlock
+                    {
+                        println!("Err: {:?}", err);
+                        // panic!("Connection timed out");
+                    } else {
+                        panic!("IO Error");
+                    }
                 }
             }
         }
@@ -166,6 +174,7 @@ impl Replica {
             buffer: MessageBuffer::zero_buffer(),
             ip,
             heartbeats: [false; MAX_CLUSTER_SIZE],
+            ticks_since_last_heartbeat: [0; MAX_CLUSTER_SIZE],
             port,
             udp_socket,
             voting_status: VotingStatus::Idle,
@@ -210,27 +219,66 @@ impl Replica {
     /// Send heartbeat to other replicas in cluster.
     /// Receive heartbeats from other replicas.
     pub fn tick(&mut self) -> Result<(), std::io::Error> {
+        debug!("Ticking...");
+        debug!("View: {:?}", self.view);
         self.collect_messages();
         self.heartbeats = [false; MAX_CLUSTER_SIZE];
+        let mut responses = vec![];
 
         let msgs = self.buffer.retrieve_messages_since_last_tick();
+        debug!("Got {} messages.", msgs.len());
         let (mut idx_other_msgs, mut other_msgs) = (0, [None; MAX_MESSAGES_PER_TICK]); // index in msgs
         for msg in msgs {
             if msg.is_none() {
+                warn!("None Message!");
                 break;
             }
             let msg = msg.unwrap();
+            debug!("Message: {:?}", msg);
             if let MessageType::Heartbeat = msg.msg_type {
                 assert!(msg.header.sender_id < MAX_CLUSTER_SIZE as u32);
                 self.heartbeats[msg.header.sender_id as usize] = true;
             } else {
+                let port = PORT_START + msg.header.sender_id as u16;
+                match msg.msg_type {
+                    MessageType::ViewInfoRequest => {
+                        info!("Received ViewInfoRequest");
+                        let response = Message::new(
+                            self.id,
+                            MessageType::ViewInfoResponse(self.view.to_view_info()),
+                            generate_snowflake_id(self.id),
+                        );
+                        self.view.add_replica(msg.header.sender_id);
+                        responses.push((response, SocketAddrV4::new(LOCALHOST, port)));
+                    }
+                    MessageType::RequestViewChange(view_info) => {
+                        debug!("Received view change request: View-Info = {:?}", view_info);
+                        let response = Message::new(
+                            self.id,
+                            MessageType::RequestViewChangeOk,
+                            generate_snowflake_id(self.id),
+                        );
+                        responses.push((response, SocketAddrV4::new(LOCALHOST, port)));
+                    }
+                    MessageType::Heartbeat => {
+                        panic!("Received Heartbeat");
+                        self.heartbeats[msg.header.sender_id as usize] = true;
+                    }
+                    _ => (),
+                }
                 other_msgs[idx_other_msgs] = Some(msg);
                 idx_other_msgs += 1;
             }
         }
 
-        self.check_heartbeats();
+        for response in responses {
+            self.send_message(response.0, response.1).unwrap();
+            println!("{:?}", self.port);
+            // panic!("Sending response");
+        }
+
         self.send_heartbeats();
+        self.check_heartbeats();
         Ok(())
     }
 
@@ -284,6 +332,7 @@ impl Replica {
 
     /// Send heartbeat messages to all other replicas in cluster.
     fn send_heartbeats(&self) {
+        debug!("Sending heartbeat");
         for port in self
             .view
             .occupied_ports
@@ -317,20 +366,48 @@ impl Replica {
 
     /// Check if other replicas replied to the heartbeat.
     /// This assumes that the message buffer is filled with the latest heartbeats
-    fn check_heartbeats(&self) {
-        info!("Checking heartbeats: {:?}", self.heartbeats);
+    fn check_heartbeats(&mut self) {
+        // info!("Checking heartbeats: {:?}", self.heartbeats);
         let received_hbs = self.heartbeats.iter().filter(|v| **v).count();
-        assert!(received_hbs < self.view.replicas.len());
+        assert!(received_hbs < self.view.occupied_ports.len());
         if received_hbs
             != self
                 .view
-                .replicas
+                .occupied_ports
                 .iter()
-                .filter(|r| **r != 0 && **r != self.id)
+                .filter(|r| **r != 0 && **r != PORT_START as u32 + self.id)
                 .count()
         {
-            debug!("rc_hbs: {:?} - {:?}", received_hbs, self.view.replicas);
-            todo!("Missing a heartbeat");
+            debug!(
+                "rc_hbs: {:?} - {:?}",
+                received_hbs, self.view.occupied_ports
+            );
+            debug!("Handling missing heartbeat.");
+            for id in self.view.occupied_ports.iter().filter_map(|p| {
+                if *p > PORT_START as u32 && *p != self.port as u32 {
+                    Some((p - PORT_START as u32) as usize)
+                } else {
+                    None
+                }
+            }) {
+                if !self.heartbeats[id] {
+                    info!("Missing heartbeat from replica {id}. Incrementing TSLHB for it.");
+                    self.ticks_since_last_heartbeat[id] += 1;
+                    if self.ticks_since_last_heartbeat[id] > MAX_MISSED_HEARTBEATS {
+                        debug!("tslhb: {:?}", self.ticks_since_last_heartbeat);
+                        debug!("hbs: {:?}", self.heartbeats);
+                        debug!("ports: {:?}", self.view.occupied_ports);
+                        todo!("Remove replica");
+                    }
+                } else {
+                    info!("Received heartbeat from replica {id}. TSLHB resets!");
+                    self.ticks_since_last_heartbeat[id] = 0;
+                }
+            }
+        }
+
+        if received_hbs > 0 {
+            println!("Got heartbeats!!!")
         }
     }
 
@@ -454,13 +531,13 @@ impl MessageBuffer {
     pub fn retrieve_messages_since_last_tick(
         &mut self,
     ) -> [Option<&Message>; MAX_MESSAGES_PER_TICK] {
+        debug!("Retrieving messages since last tick");
         let mut msgs: [Option<&Message>; MAX_MESSAGES_PER_TICK] = [None; MAX_MESSAGES_PER_TICK];
         let mut idx_msgs = 0;
         if self.msg_count_since_last_tick == 0 {
-            debug!("No message since last tick");
+            // debug!("No message since last tick");
             return msgs;
         }
-        panic!("received a message");
         loop {
             let idx = self.idx_last_message;
             self.msg_count_since_last_tick -= 1;
